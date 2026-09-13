@@ -41,6 +41,10 @@ fn rns(s: f32) -> f32 {
     return s * sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
 }
 
+fn clampi(x: i32, lo: i32, hi: i32) -> i32 {
+    return clamp(x, lo, hi);
+}
+
 fn tri_pt(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, px: f32, py: f32) -> bool {
     let e1 = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
     let e2 = (cx - bx) * (py - by) - (cy - by) * (px - bx);

@@ -94,11 +94,27 @@ fn main() -> Result<()> {
     let mut eng = Engine::new(frame.target.clone(), frame.w, frame.h, out_w, out_h, ss, bg)?;
     eng.set_frame_seed(seed);
     for _ in 0..num {
-        eng.step(mode, alpha, seed)?;
+        let mut ok = None;
+        for attempt in 0..3u32 {
+            match eng.step(mode, alpha, seed ^ (attempt << 16)) {
+                Ok(row) => {
+                    ok = Some(row);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        ok.ok_or_else(|| anyhow::anyhow!("optimizer failed after retries"))?;
         eprint!(".");
     }
     eprintln!();
-    let img = eng.render()?;
+    let mut img = eng.render()?;
+    for _ in 0..4 {
+        if let Ok(d) = eng.render() {
+            img = d;
+            break;
+        }
+    }
     io::save_png(&output, out_w, out_h, &img)?;
     eprintln!("wrote {} ({} shapes, score {:.4})", output, num, eng.score);
     Ok(())

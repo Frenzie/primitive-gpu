@@ -52,6 +52,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let row = i * 14u;
         let id = u32(shapes[row + 1u]);
         if (id >= 1u && id <= 8u) {
+            // cheap bbox reject: skip shapes whose bbox can't contain px
+            var p0: array<f32, 8>;
+            for (var j = 0u; j < 8u; j = j + 1u) {
+                p0[j] = shapes[row + 6u + j];
+            }
+            let b4 = bbox_of(id, p0);
+            if (fx < b4.x || fx > b4.z || fy < b4.y || fy > b4.w) {
+                i = i + 1u;
+                continue;
+            }
             let alpha = max(shapes[row + 2u], 1.0);
             var p: array<f32, 8>;
             for (var j = 0u; j < 8u; j = j + 1u) {

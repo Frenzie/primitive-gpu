@@ -35,3 +35,4 @@ pub const RENDER_WGSL: &str = concat!(
     include_str!("../shaders/common.wgsl"),
     include_str!("../shaders/render.wgsl")
 );
+pub const RESCORE_WGSL: &str = include_str!("../shaders/rescore.wgsl");

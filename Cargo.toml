@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+naga = { version = "24", features = ["wgsl-in"] }
 wgpu = "24"
 pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }

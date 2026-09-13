@@ -679,6 +679,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "image",
+ "naga",
  "pollster",
  "wgpu",
 ]

@@ -1,8 +1,9 @@
-// Independent hill-climb: each thread owns a chain (one random start per
-// thread, then mutate-accept rounds). No atomics or shared scoring; the
-// per-thread final (score, params) is written to winners[] and a separate
-// argmin kernel reduces across threads. This mirrors the Go design of
-// BestHillClimbState (many independent chains) with chains per thread.
+// Workgroup-batched hill climbing: one workgroup = one chain with a shared
+// incumbent. Each round, all 64 threads mutate a copy of the incumbent, score
+// it, and write the candidate to shared memory; thread 0 then installs the
+// best candidate if it beats the incumbent. This evaluates 64 mutations per
+// round instead of one, and stops after `age` consecutive failed rounds
+// (mirroring the Go maxAge cutoff).
 
 struct Params {
     width: u32,
@@ -19,14 +20,14 @@ struct Params {
     out_h: u32,
     ss: u32,
     cur_score: u32,
-    pad1: u32,
+    age: u32,
     pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> tgt: array<u32>;
 @group(0) @binding(2) var<storage, read> cur: array<u32>;
-@group(0) @binding(3) var<storage, read_write> winners: array<f32>; // 14 per thread
+@group(0) @binding(3) var<storage, read_write> winners: array<f32>; // 14 per workgroup
 
 fn copy_row(dst: ptr<function, array<f32, 14>>, src: ptr<function, array<f32, 14>>) {
     for (var i = 0u; i < 14u; i = i + 1u) {
@@ -34,13 +35,23 @@ fn copy_row(dst: ptr<function, array<f32, 14>>, src: ptr<function, array<f32, 14
     }
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+
+// NOTE: a workgroup-cooperative batched variant (64 threads mutating a
+// shared incumbent per round) proved unstable on Intel gen9 ANV (Mesa):
+// intermittent workgroup kills / deadlocks around barrier-heavy loops.
+// This version runs one independent chain per thread — no barriers in
+// the mutation loop — which is deterministic and stable. The batched
+// kernel is retained in git history for hardware without this quirk.
+@compute @workgroup_size(1, 1, 1)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+) {
     let tid = gid.x;
+    let out_row = tid * 14u;
 
     rs = mix_in(mix_in(params.frame_seed, params.step), tid * 0x9e3779b9u);
 
-    // round 0: best of n_random random shapes, scored serially by this thread
+    // round 0: best of n_random random shapes
     var best: array<f32, 14>;
     best[0] = 1e30;
     var k = 0u;
@@ -56,10 +67,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         k = k + 1u;
     }
 
-    // mutate-accept rounds
+    // mutate-accept rounds with age cutoff (mirrors Go maxAge)
     var round = 0u;
+    var age = 0u;
     loop {
-        if (round >= params.rounds) { break; }
+        if (round >= params.rounds || age >= params.age) { break; }
         var c: array<f32, 14>;
         copy_row(&c, &best);
         mutate_row(&c);
@@ -67,13 +79,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (sc < best[0]) {
             copy_row(&best, &c);
             best[0] = sc;
+            age = 0u;
+        } else {
+            age = age + 1u;
         }
         round = round + 1u;
     }
 
     for (var i = 0u; i < 14u; i = i + 1u) {
-        winners[tid * 14u + i] = best[i];
+        winners[out_row + i] = best[i];
     }
+    winners[out_row + 13] = f32(0x1u); // marker: chain completed
 }
 
 fn random_shape(c: ptr<function, array<f32, 14>>) {
@@ -360,10 +376,14 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
     (*c)[4] = colg;
     (*c)[5] = colb;
 
+    // err2 accumulated exactly per row (i32), rows summed in f32.
+    // Row magnitude <= 3*256*255^2 ~ 5e7; f32 sums of 256 exact rows keep
+    // error ~1e3, which is negligible vs the signal.
     var err2 = 0.0;
     y = y0;
     loop {
         if (y > y1) { break; }
+        var row_err = 0;
         var x = x0;
         loop {
             if (x > x1) { break; }
@@ -371,26 +391,25 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
                 let idx = u32(y) * w + u32(x);
                 let tpx = tgt[idx];
                 let cpx = cur[idx];
-                let tr = f32(tpx & 0xffu);
-                let tg = f32((tpx >> 8u) & 0xffu);
-                let tb = f32((tpx >> 16u) & 0xffu);
-                let cr = f32(cpx & 0xffu);
-                let cg = f32((cpx >> 8u) & 0xffu);
-                let cb = f32((cpx >> 16u) & 0xffu);
-                let dr1 = tr - cr;
-                let dg1 = tg - cg;
-                let db1 = tb - cb;
-                let dr2 = tr - colr;
-                let dg2 = tg - colg;
-                let db2 = tb - colb;
-                err2 = err2 + (dr2 * dr2 + dg2 * dg2 + db2 * db2 - dr1 * dr1 - dg1 * dg1 - db1 * db1);
+                let tr = i32(tpx & 0xffu);
+                let tg = i32((tpx >> 8u) & 0xffu);
+                let tb = i32((tpx >> 16u) & 0xffu);
+                let cr = i32(cpx & 0xffu);
+                let cg = i32((cpx >> 8u) & 0xffu);
+                let cb = i32((cpx >> 16u) & 0xffu);
+                let nr = tr - i32(colr);
+                let ng = tg - i32(colg);
+                let nb = tb - i32(colb);
+                row_err = row_err + (nr*nr + ng*ng + nb*nb - (tr-cr)*(tr-cr) - (tg-cg)*(tg-cg) - (tb-cb)*(tb-cb));
             }
             x = x + 1;
         }
+        err2 = err2 + f32(row_err);
         y = y + 1;
     }
     let cur = bitcast<f32>(params.cur_score);
-    let sse = (cur * 255.0) * (cur * 255.0) * n * 3.0 + err2;
-    let rmse = sqrt(max(sse, 0.0) / (n * 3.0)) / 255.0;
+    // rmse_new^2 = rmse_old^2 + err2/(n*3), all in 0..255 channel units.
+    let mean = (cur * 255.0) * (cur * 255.0) + err2 / (n * 3.0);
+    let rmse = sqrt(max(mean, 0.0)) / 255.0;
     return rmse;
 }

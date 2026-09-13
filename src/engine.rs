@@ -15,6 +15,8 @@ pub struct Engine {
     optimize_pipeline: wgpu::ComputePipeline,
     commit_pipeline: wgpu::ComputePipeline,
     render_pipeline: wgpu::ComputePipeline,
+    rescore_pipeline: wgpu::ComputePipeline,
+    rescore_bg: wgpu::BindGroup,
     render_out_buf: wgpu::Buffer,
     render_bg: wgpu::BindGroup,
     readback_buf: wgpu::Buffer,
@@ -29,6 +31,7 @@ pub struct Engine {
     shape_type: i32,
     alpha: i32,
     frame_seed: u32,
+    age: u32,
 }
 
 #[repr(C)]
@@ -48,16 +51,15 @@ struct Uniform {
     out_h: u32,
     ss: u32,
     cur_score: u32,
-    pad1: u32,
+    age: u32,
     pad2: u32,
 }
 
-const WG_COUNT: u32 = 64; // workgroups per optimize dispatch
-const WG_SIZE: u32 = 64; // threads per workgroup
-const WG_THREADS: u32 = WG_COUNT * WG_SIZE; // total hill-climb chains
-const ROUNDS: u32 = 24; // mutations per chain
-const N_RANDOM: u32 = 16; // random candidates per chain start
-
+const WG_COUNT: u32 = 1024; // independent hill-climb chains (one thread each)
+const WG_SIZE: u32 = 64; // threads per workgroup (parallel mutations per round)
+const ROUNDS: u32 = 24;
+const N_RANDOM: u32 = 16;
+const AGE: u32 = 16;
 fn pick_adapter(instance: &wgpu::Instance) -> Result<(wgpu::Device, wgpu::Queue)> {
     // Some drivers (Intel gen9 ANV on Mesa) lose the device compiling large
     // shaders; probe each adapter against the real optimize shader and use
@@ -147,14 +149,14 @@ impl Engine {
         });
         let winners_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("winners"),
-            size: WG_THREADS as u64 * ROW_BYTES as u64,
+            size: WG_COUNT as u64 * ROW_BYTES as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let shapes_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shapes"),
             size: ROW_BYTES as u64 * MAX_SHAPES as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -165,7 +167,7 @@ impl Engine {
         });
         let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
-            size: WG_THREADS as u64 * ROW_BYTES as u64,
+            size: WG_COUNT as u64 * ROW_BYTES as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -234,6 +236,7 @@ impl Engine {
         let optimize_pipeline = mk("optimize", OPTIMIZE_WGSL, &optimize_bgl);
         let commit_pipeline = mk("commit", COMMIT_WGSL, &commit_bgl);
         let render_pipeline = mk("render", RENDER_WGSL, &render_bgl);
+        let rescore_pipeline = mk("rescore", RESCORE_WGSL, &optimize_bgl);
 
         let pb = params_buf.as_entire_binding();
         let tb = target_buf.as_entire_binding();
@@ -258,6 +261,7 @@ impl Engine {
         };
         let optimize_bg = mk_bg(&optimize_bgl, None);
         let commit_bg = mk_bg(&commit_bgl, None);
+        let rescore_bg = mk_bg(&optimize_bgl, None);
         // render needs bindings 4 (shapes) and 5 (output): a persistent buffer.
         let render_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("render-out"),
@@ -283,7 +287,9 @@ impl Engine {
         let canvas = vec![bg_u; (w * h) as usize];
         queue.write_buffer(&canvas_buf, 0, bytemuck::cast_slice(&canvas));
 
+        let score = initial_score(&target, w, h, bg);
         Ok(Engine {
+            score,
             device,
             queue,
             target_buf,
@@ -296,6 +302,8 @@ impl Engine {
             optimize_pipeline,
             commit_pipeline,
             render_pipeline,
+            rescore_pipeline,
+            rescore_bg,
             render_out_buf,
             render_bg,
             readback_buf,
@@ -306,10 +314,10 @@ impl Engine {
             ss,
             bg,
             num_shapes: 0,
-            score: 1.0,
             shape_type: MODE_TRIANGLE,
             alpha: 128,
             frame_seed: 0,
+            age: AGE,
         })
     }
 
@@ -329,7 +337,7 @@ impl Engine {
             out_h: self.out_h,
             ss: self.ss,
             cur_score: (self.score as f32).to_bits(),
-            pad1: 0,
+            age: self.age,
             pad2: 0,
         }
     }
@@ -355,7 +363,7 @@ impl Engine {
             0,
             &self.readback_buf,
             0,
-            WG_THREADS as u64 * ROW_BYTES as u64,
+            WG_COUNT as u64 * ROW_BYTES as u64,
         );
         self.queue.submit(Some(enc.finish()));
 
@@ -363,8 +371,12 @@ impl Engine {
         let rows: &[f32] = bytemuck::cast_slice(&raw);
         let mut best = [0f32; ROW];
         best[0] = f32::INFINITY;
-        for wg in 0..WG_THREADS as usize {
+        for wg in 0..WG_COUNT as usize {
             let r = &rows[wg * ROW..(wg + 1) * ROW];
+            // skip never-completed chains (id 0): killed/hung workgroups
+            if r[1] == 0.0 {
+                continue;
+            }
             if r[0] < best[0] {
                 best.copy_from_slice(r);
             }
@@ -396,6 +408,10 @@ impl Engine {
             pass.dispatch_workgroups((self.w * self.h + 63) / 64, 1, 1);
         }
         self.queue.submit(Some(enc.finish()));
+        if std::env::var("PG_TRACE_STEP").is_ok() {
+            eprintln!("step{}: score={:.6} id={} p=({:.1},{:.1},{:.1},{:.1},{:.1},{:.1})",
+                self.num_shapes, best[0], best[1], best[6], best[7], best[8], best[9], best[10], best[11]);
+        }
         self.score = best[0] as f64;
         Ok(best)
     }
@@ -428,7 +444,38 @@ impl Engine {
         enc.copy_buffer_to_buffer(&self.render_out_buf, 0, &rb_buf, 0, n_px * 4);
         self.queue.submit(Some(enc.finish()));
         let data = crate::gpuio::read_bytes(&self.device, &rb_buf);
+        if std::env::var("PG_DUMP_ROWS").is_ok() {
+            let sz = (self.num_shapes as u64) * ROW_BYTES as u64;
+            let rbb = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rows-read"),
+                size: (self.num_shapes as u64) * ROW_BYTES as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut e2 = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            e2.copy_buffer_to_buffer(&self.shapes_buf, 0, &rbb, 0, (self.num_shapes as u64) * ROW_BYTES as u64);
+            self.queue.submit(Some(e2.finish()));
+            let rows = crate::gpuio::read_bytes(&self.device, &rbb);
+            let rf: &[f32] = bytemuck::cast_slice(&rows);
+            for r in rf.chunks(14).take(3) {
+                eprintln!("row: {:.3} id={} a={} c=({:.0},{:.0},{:.0})", r[0], r[1], r[2], r[3], r[4], r[5]);
+            }
+        }
 
+        if std::env::var("PG_DUMP_RAW").is_ok() {
+            io_dump(&data, w, h);
+        }
+        if self.num_shapes > 0 {
+            let mut nonzero = 0u64;
+            for c in data.chunks_exact(4) {
+                if c[0] + c[1] + c[2] > 10 {
+                    nonzero += 1;
+                }
+            }
+            if nonzero == 0 {
+                return Err(anyhow!("render produced no output (GPU kill?)"));
+            }
+        }
         // box-downsample ss x ss to out_w x out_h
         let mut out = vec![0u8; (self.out_w * self.out_h * 4) as usize];
         for oy in 0..self.out_h {
@@ -480,6 +527,10 @@ impl Engine {
         self.frame_seed = s;
     }
 
+    pub fn set_age(&mut self, a: u32) {
+        self.age = a;
+    }
+
     /// Start a fresh optimization for a new video frame.
     pub fn reset_for_frame(&mut self, target: Vec<u8>) {
         self.num_shapes = 0;
@@ -489,6 +540,26 @@ impl Engine {
         let canvas = vec![bg_u; (self.w * self.h) as usize];
         self.queue.write_buffer(&self.canvas_buf, 0, bytemuck::cast_slice(&canvas));
     }
+}
+
+fn io_dump(data: &[u8], w: u32, h: u32) {
+    let mut nonzero = 0u64;
+    for c in data.chunks_exact(4) {
+        if c[0] + c[1] + c[2] > 10 { nonzero += 1; }
+    }
+    eprintln!("raw render {}x{} nonzero-px {}", w, h, nonzero);
+}
+
+fn initial_score(target: &[u8], w: u32, h: u32, bg: [u8; 3]) -> f64 {
+    let mut total = 0u64;
+    for px in target.chunks_exact(4) {
+        for c in 0..3 {
+            let d = px[c] as i64 - bg[c] as i64;
+            total += (d * d) as u64;
+        }
+    }
+    let n = (w * h) as u64;
+    (f64::sqrt(total as f64 / (w * h * 3) as f64) / 255.0) as f64
 }
 
 fn bg_packed(bg: [u8; 3]) -> u32 {

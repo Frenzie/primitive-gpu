@@ -1,0 +1,14 @@
+[package]
+name = "primitive-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "24"
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"

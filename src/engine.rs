@@ -12,7 +12,6 @@ pub struct Engine {
     params_buf: wgpu::Buffer,
     optimize_bg: wgpu::BindGroup,
     commit_bg: wgpu::BindGroup,
-    render_bg: wgpu::BindGroup,
     optimize_pipeline: wgpu::ComputePipeline,
     commit_pipeline: wgpu::ComputePipeline,
     render_pipeline: wgpu::ComputePipeline,
@@ -166,7 +165,6 @@ impl Engine {
         };
         let optimize_bg = bind(&optimize_pipeline);
         let commit_bg = bind(&commit_pipeline);
-        let render_bg = bind(&render_pipeline);
 
         // seed canvas with bg color
         let bg_u = bg_packed(bg);
@@ -183,7 +181,6 @@ impl Engine {
             params_buf,
             optimize_bg,
             commit_bg,
-            render_bg,
             optimize_pipeline,
             commit_pipeline,
             render_pipeline,
@@ -202,8 +199,29 @@ impl Engine {
         })
     }
 
+    fn uniform(&self) -> Uniform {
+        Uniform {
+            width: self.w,
+            height: self.h,
+            shape_type: self.shape_type,
+            alpha: self.alpha,
+            rounds: ROUNDS,
+            n_random: N_RANDOM,
+            frame_seed: self.frame_seed,
+            step: self.num_shapes,
+            num_shapes: self.num_shapes,
+            bg: bg_packed(self.bg),
+            out_w: self.out_w,
+            out_h: self.out_h,
+            ss: self.ss,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
+        }
+    }
+
     /// One optimization step: find the best shape and commit it to the canvas.
-    pub fn step(&mut self, shape_type: i32, alpha: i32, frame_seed: u32) -> Result<[f32; ROW]> {
+    pub fn step(&mut self, _shape_type: i32, _alpha: i32, _frame_seed: u32) -> Result<[f32; ROW]> {
         let u = self.uniform();
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&u));
 
@@ -259,32 +277,11 @@ impl Engine {
             });
             pass.set_pipeline(&self.commit_pipeline);
             pass.set_bind_group(0, &self.commit_bg, &[]);
-            pass.dispatch_workgroups((w_h(self.w, self.h) + 63) / 64, 1, 1);
+            pass.dispatch_workgroups((self.w * self.h + 63) / 64, 1, 1);
         }
         self.queue.submit(Some(enc.finish()));
         self.score = best[0] as f64;
         Ok(best)
-    }
-
-    fn uniform(&self) -> Uniform {
-        Uniform {
-            width: self.w,
-            height: self.h,
-            shape_type: self.shape_type,
-            alpha: self.alpha,
-            rounds: ROUNDS,
-            n_random: N_RANDOM,
-            frame_seed: self.frame_seed,
-            step: self.num_shapes,
-            num_shapes: self.num_shapes,
-            bg: bg_packed(self.bg),
-            out_w: self.out_w,
-            out_h: self.out_h,
-            ss: self.ss,
-            pad0: 0,
-            pad1: 0,
-            pad2: 0,
-        }
     }
 
     /// High-quality analytic render at out_w x out_h (supersampled).
@@ -304,7 +301,7 @@ impl Engine {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let render_bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let render_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.render_pipeline.get_bind_group_layout(0),
             entries: &[
@@ -326,7 +323,7 @@ impl Engine {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.render_pipeline);
-            pass.set_bind_group(0, &render_bg2, &[]);
+            pass.set_bind_group(0, &render_bg, &[]);
             pass.dispatch_workgroups(((n_px + 63) / 64) as u32, 1, 1);
         }
         enc.copy_buffer_to_buffer(&out_buf, 0, &rb_buf, 0, n_px * 4);
@@ -369,24 +366,15 @@ impl Engine {
         self.frame_seed = s;
     }
 
-    /// Start a fresh optimization for a new video frame: reset shape count
-    /// and re-seed the canvas to bg. (Temporal reuse is a later flag.)
+    /// Start a fresh optimization for a new video frame.
     pub fn reset_for_frame(&mut self, target: Vec<u8>) {
         self.num_shapes = 0;
         self.score = 1.0;
-        self.queue.write_buffer(
-            &self.target_buf,
-            0,
-            &target,
-        );
+        self.queue.write_buffer(&self.target_buf, 0, &target);
         let bg_u = bg_packed(self.bg);
         let canvas = vec![bg_u; (self.w * self.h) as usize];
         self.queue.write_buffer(&self.canvas_buf, 0, bytemuck::cast_slice(&canvas));
     }
-}
-
-fn w_h(w: u32, h: u32) -> u32 {
-    w * h
 }
 
 fn bg_packed(bg: [u8; 3]) -> u32 {

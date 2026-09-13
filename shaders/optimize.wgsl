@@ -284,7 +284,7 @@ fn mutate_row(c: ptr<function, array<f32, 14>>) {
         (*c)[3 + i] = p[i];
     }
     if (params.alpha == 0) {
-        (*c)[2] = f32(clamp(i32((*c)[2]) + i32(ru() % 21u) - 10, 1, 255));
+        (*c)[2] = f32(clamp(i32((*c)[2]) + i32(ru() % 21u) - i32(10u), 1, 255));
     }
 }
 
@@ -325,9 +325,9 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
                 sb = sb + (f32((tpx >> 16u) & 0xffu) - f32((cpx >> 16u) & 0xffu));
                 area = area + 1.0;
             }
-            x = x + 1u;
+            x = x + 1;
         }
-        y = y + 1u;
+        y = y + 1;
     }
     if (area < 1.0) {
         return 1e30;
@@ -352,9 +352,9 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
                 csg = csg + f32((cpx >> 8u) & 0xffu);
                 csb = csb + f32((cpx >> 16u) & 0xffu);
             }
-            x = x + 1u;
+            x = x + 1;
         }
-        y = y + 1u;
+        y = y + 1;
     }
     let colr = clamp((sr * a + csr) / area, 0.0, 255.0);
     let colg = clamp((sg * a + csg) / area, 0.0, 255.0);
@@ -385,9 +385,9 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
                 let db2 = tb - colb;
                 err2 = err2 + (dr2 * dr2 + dg2 * dg2 + db2 * db2 - dr1 * dr1 - dg1 * dg1 - db1 * db1);
             }
-            x = x + 1u;
+            x = x + 1;
         }
-        y = y + 1u;
+        y = y + 1;
     }
     let cur = (*c)[0];
     if (cur >= 1e29) {

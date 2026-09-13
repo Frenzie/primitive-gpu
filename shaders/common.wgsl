@@ -22,6 +22,15 @@ fn ru() -> u32 {
     return pcg();
 }
 
+fn mix_in(h: u32, v: u32) -> u32 {
+    var x = h ^ v;
+    x = x * 0x27220a95u;
+    x = x ^ (x >> 15u);
+    x = x * 0x85ebca6bu;
+    x = x ^ (x >> 13u);
+    return x;
+}
+
 fn rf() -> f32 {
     return f32(ru() >> 8u) * (1.0 / 16777216.0);
 }

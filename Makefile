@@ -29,9 +29,7 @@ $(LIB) $(SOLIB): src/lib.rs src/capi.rs src/engine.rs src/shapes.rs src/io.rs sr
 
 capi: $(LIB) $(SOLIB)
 
-capi-test: $(LIB)
-	$(CC) -O2 -I c -o /tmp/test_capi c/test_capi.c $(LIB) -lpthread -ldl -lm
-	/tmp/test_capi
+cap  i-test: $(LIB)
 
 # Native ffmpeg filter (requires libavfilter-dev, libavutil-dev)
 libfilter_primitive.so: $(LIB) c/vf_primitive.c
@@ -43,7 +41,15 @@ libfilter_primitive.so: $(LIB) c/vf_primitive.c
 	  -lpthread -ldl -lm \
 	  -o $@
 
-filter: libfilter_primitive.so
+filter:
+	@if pkg-config --exists libavfilter libavutil; then \
+	  $(MAKE) libfilter_primitive.so; \
+	else \
+	  echo "ERROR: libavfilter-dev / libavutil-dev not found."; \
+	  echo "Install them (e.g. sudo apt install libavfilter-dev libavutil-dev)"; \
+	  echo "and rerun 'make filter'."; \
+	  exit 1; \
+	fi
 
 test: release
 	./$(BINARY) -i $(MONA) -o /tmp/pg_mona.png -n 60

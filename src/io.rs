@@ -3,7 +3,7 @@ use image::{imageops::FilterType, GenericImageView, ImageBuffer, Rgba};
 use std::path::Path;
 
 pub struct Frame {
-    pub target: Vec<u8>, // internal res, RGBA8, premultiplied? No — plain NRGBA bytes
+    pub target: Vec<u8>, // internal res, RGBA8 bytes
     pub w: u32,
     pub h: u32,
 }
@@ -29,8 +29,9 @@ pub fn load_target(path: &str, internal: u32) -> Result<Frame> {
 fn to_nrgba_bytes<I: GenericImageView<Pixel = Rgba<u8>>>(img: &I) -> Vec<u8> {
     let (w, h) = img.dimensions();
     let mut out = vec![0u8; (w * h * 4) as usize];
-    for (i, p) in img.pixels().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&p.0);
+    for (i, (_, _, p)) in img.pixels().enumerate() {
+        let rgba = p.0;
+        out[i * 4..i * 4 + 4].copy_from_slice(&rgba);
     }
     out
 }

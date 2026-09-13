@@ -1,5 +1,5 @@
-// Commit kernel: thread-per-pixel; row 0..3 = winner shape; blends winner
-// into canvas using its computed color at row offsets 3..6.
+// Commit kernel: blend the winning shape (winners[0..13] after argmin writes
+// it there) into canvas at its stored color. One thread per pixel.
 
 struct Params {
     width: u32,
@@ -21,10 +21,9 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> target: array<u32>;
-@group(0) @binding(2) var<storage, read_write> canvas: array<u32>;
-@group(0) @binding(3) var<storage, read> winners: array<f32>;
-@group(0) @binding(4) var<storage, read> shapes: array<f32>;
+@group(0) @binding(1) var<storage, read> tgt: array<u32>;
+@group(0) @binding(2) var<storage, read_write> cur: array<u32>;
+@group(0) @binding(3) var<storage, read_write> winners: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -34,28 +33,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= w * h) {
         return;
     }
-    let x = idx % w;
-    let y = idx / w;
-    let row = winners[0..14];  // NOTE: replaced below with explicit loop
+    let x = f32(idx % w);
+    let y = f32(idx / w);
+
+    let id = u32(winners[1]);
+    let alpha = u32(max(winners[2], 1.0));
     var p: array<f32, 8>;
-    for (var i = 0u; i < 8u; i += 1u) {
+    for (var i = 0u; i < 8u; i = i + 1u) {
         p[i] = winners[3 + i];
     }
-    let id = u32(winners[1]);
-    let alpha = u32(winners[2]);
-    let r = winners[3 + 0];
-    var inside = inside_of(id, p, f32(x), f32(y));
-    if (inside) {
-        // optimal color was computed in optimizer; recompute locally for this
-        // pixel? No — recompute color globally requires global sums. Instead
-        // the optimizer stores color in row[3..6]; we blend with that.
+    if (!inside_of(id, p, x, y)) {
+        return;
     }
-    let cr = f32(canvas[idx] & 0xffu);
-    let cg = f32((canvas[idx] >> 8u) & 0xffu);
-    let cb = f32((canvas[idx] >> 16u) & 0xffu);
-    // Blend (source-over, NRGBA) using the shape color from winners row.
-    // winners[3..6] hold the OPTIMAL COLOR (r,g,b) chosen by the optimizer
-    // and winners[2] the alpha. For simplicity the optimizer stores its final
-    // color in p[0..3]... this design note is resolved in the final port:
-    // the optimizer writes color into winners[3..6] and params in p[0..7].
+    // optimal color was stored in winners[4..7] (r,g,b) by the optimizer via
+    // the argmin kernel; blend source-over with NRGBA semantics.
+    let sr = winners[4];
+    let sg = winners[5];
+    let sb = winners[6];
+    let sa = f32(alpha) / 255.0;
+    let cpx = cur[idx];
+    let dr = f32(cpx & 0xffu);
+    let dg = f32((cpx >> 8u) & 0xffu);
+    let db = f32((cpx >> 16u) & 0xffu);
+    let nr = u32(sr * sa + dr * (1.0 - sa));
+    let ng = u32(sg * sa + dg * (1.0 - sa));
+    let nb = u32(sb * sa + db * (1.0 - sa));
+    cur[idx] = nr | (ng << 8u) | (nb << 16u) | 0xff000000u;
 }

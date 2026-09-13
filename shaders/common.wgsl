@@ -1,14 +1,14 @@
-// Shared prelude, concatenated before every kernel by engine.rs.
-// Row layout (14 f32): [score, id, alpha, r, g, b, p0..p7]
+// Shared prelude, concatenated before every kernel by shapes.rs.
+// Shape row layout (14 f32): [score, id, alpha, r, g, b, p0..p7]
 //   id 1 triangle    p0..5  x1,y1,x2,y2,x3,y3
-//   id 2 rect        p0..3  x1,y1,x2,y2   (axis-aligned)
+//   id 2 rect        p0..3  x1,y1,x2,y2   (axis-aligned, inclusive)
 //   id 3 ellipse     p0..3  cx,cy,rx,ry
 //   id 4 circle      p0..3  cx,cy,r,r
 //   id 5 rot rect    p0..4  cx,cy,sx,sy,angle(deg)
-//   id 6 quadratic   p0..5  x1,y1,cx,cy,x2,y2 (half-width fixed 0.25 like Go)
+//   id 6 quadratic   p0..6  x1,y1,cx,cy,x2,y2,width
 //   id 7 rot ellipse p0..4  cx,cy,rx,ry,angle(deg)
 //   id 8 polygon     p0..7  quad vertices x,y * 4
-// Pixels are sampled at integer coords to mirror the Go rasterizers.
+// Pixels are sampled at integer coordinates to mirror the Go rasterizers.
 
 var<private> rs: u32;
 
@@ -24,10 +24,6 @@ fn ru() -> u32 {
 
 fn rf() -> f32 {
     return f32(ru() >> 8u) * (1.0 / 16777216.0);
-}
-
-fn rfs(lo: f32, hi: f32) -> f32 {
-    return lo + (hi - lo) * rf();
 }
 
 fn rns(s: f32) -> f32 {
@@ -91,7 +87,7 @@ fn quad_valid(p: array<f32, 8>) -> bool {
 fn inside_poly(p: array<f32, 8>, x: f32, y: f32) -> bool {
     var inside = false;
     var j = 3u;
-    for (var i = 0u; i < 4u; i += 1u) {
+    for (var i = 0u; i < 4u; i = i + 1u) {
         let xi = p[i * 2u];
         let yi = p[i * 2u + 1u];
         let xj = p[j * 2u];
@@ -127,10 +123,11 @@ fn inside_of(id: u32, p: array<f32, 8>, px: f32, py: f32) -> bool {
         let ty = -dx * sa + dy * ca;
         return abs(tx) <= p[2] * 0.5 && abs(ty) <= p[3] * 0.5;
     } else if (id == 6u) {
+        let hw = max(p[6], 0.25) * 0.5;
         var md = 1e30;
         var qx = p[0];
         var qy = p[1];
-        for (var i = 1u; i <= 12u; i += 1u) {
+        for (var i = 1u; i <= 12u; i = i + 1u) {
             let t = f32(i) / 12.0;
             let mt = 1.0 - t;
             let bx = mt * mt * p[0] + 2.0 * mt * t * p[2] + t * t * p[4];
@@ -139,7 +136,7 @@ fn inside_of(id: u32, p: array<f32, 8>, px: f32, py: f32) -> bool {
             qx = bx;
             qy = by;
         }
-        return md <= 0.25;
+        return md <= hw;
     } else if (id == 7u) {
         let a = radians(p[4]);
         let ca = cos(a);
@@ -181,9 +178,9 @@ fn bbox_of(id: u32, p: array<f32, 8>) -> vec4<f32> {
         var mny = 1e30;
         var mxx = -1e30;
         var mxy = -1e30;
-        for (var i = 0u; i < 4u; i += 1u) {
+        for (var i = 0u; i < 4u; i = i + 1u) {
             let sx = select(-1.0, 1.0, i == 1u || i == 2u);
-            let sy = select(-1.0, 1.0, i >= 2u);
+            let sy = select(-1.0, 1.0, i == 0u || i == 1u);
             let x = hx * sx * ca - hy * sy * sa + p[0];
             let y = hx * sx * sa + hy * sy * ca + p[1];
             mnx = min(mnx, x);
@@ -193,11 +190,12 @@ fn bbox_of(id: u32, p: array<f32, 8>) -> vec4<f32> {
         }
         return vec4<f32>(mnx - 1.0, mny - 1.0, mxx + 1.0, mxy + 1.0);
     } else if (id == 6u) {
+        let m = max(p[6], 0.25) * 0.5 + 1.0;
         return vec4<f32>(
-            min(min(p[0], p[2]), p[4]) - 2.0,
-            min(min(p[1], p[3]), p[5]) - 2.0,
-            max(max(p[0], p[2]), p[4]) + 2.0,
-            max(max(p[1], p[3]), p[5]) + 2.0);
+            min(min(p[0], p[2]), p[4]) - m,
+            min(min(p[1], p[3]), p[5]) - m,
+            max(max(p[0], p[2]), p[4]) + m,
+            max(max(p[1], p[3]), p[5]) + m);
     } else if (id == 7u) {
         let a = radians(p[4]);
         let ca = abs(cos(a));
@@ -210,7 +208,7 @@ fn bbox_of(id: u32, p: array<f32, 8>) -> vec4<f32> {
         var mny = 1e30;
         var mxx = -1e30;
         var mxy = -1e30;
-        for (var i = 0u; i < 4u; i += 1u) {
+        for (var i = 0u; i < 4u; i = i + 1u) {
             mnx = min(mnx, p[i * 2u]);
             mny = min(mny, p[i * 2u + 1u]);
             mxx = max(mxx, p[i * 2u]);

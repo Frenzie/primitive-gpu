@@ -37,13 +37,27 @@ jobs:
       - name: Build C ABI libraries
         run: cargo build --release --features capi
 
-      - name: C ABI smoke test
+      - name: Detect healthy Vulkan adapter
+        id: gpu
+        run: |
+          if ./target/release/pgpu-probe; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::warning::No adapter can compile the kernels; skipping GPU smoke tests"
+          fi
+
+      - name: C ABI build + link check
         run: |
           cc -O2 -I c -o /tmp/test_capi c/test_capi.c \
             target/release/libprimitive_gpu.a -lpthread -ldl -lm
-          /tmp/test_capi
+
+      - name: C ABI smoke test
+        if: steps.gpu.outputs.available == 'true'
+        run: /tmp/test_capi
 
       - name: Image smoke test
+        if: steps.gpu.outputs.available == 'true'
         run: |
           ffmpeg -y -v error -f lavfi -i testsrc2=size=320x180:rate=10:duration=1 \
             -frames:v 1 /tmp/source.png
@@ -52,6 +66,7 @@ jobs:
           test -s /tmp/out.png && echo "image OK"
 
       - name: Video pipe smoke test
+        if: steps.gpu.outputs.available == 'true'
         run: |
           ffmpeg -y -v error -f lavfi -i testsrc2=size=320x180:rate=10:duration=1 \
             -pix_fmt rgb24 -f rawvideo - \
@@ -64,6 +79,7 @@ jobs:
           test "$COUNT" = "10" && echo "video OK"
 
       - name: Video reuse smoke test
+        if: steps.gpu.outputs.available == 'true'
         run: |
           ffmpeg -y -v error -f lavfi -i testsrc2=size=320x180:rate=10:duration=3 \
             -pix_fmt rgb24 -f rawvideo - \

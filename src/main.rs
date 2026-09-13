@@ -152,7 +152,7 @@ fn run_video(
         }
         // rgb24 -> internal target
         let (iw, ih) = if vw >= vh { (input_size, input_size * vh / vw) } else { (input_size * vw / vh, input_size) };
-        let target = resize_rgb24(&buf, vw, vh, iw, ih);
+        let target = resize_rgb24_to_rgba(&buf, vw, vh, iw, ih);
         if eng.is_none() {
             let bg = primitive_gpu::io::average_color(&target, iw, ih);
             eng = Some(Engine::new(target.clone(), iw, ih, vw, vh, ss, bg)?);
@@ -193,15 +193,19 @@ fn run_video(
     Ok(())
 }
 
-fn resize_rgb24(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
-    let mut dst = vec![0u8; (dw * dh * 3) as usize];
+/// Downscale an rgb24 frame to dw×dh and expand to RGBA8 (engine format).
+fn resize_rgb24_to_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let mut dst = vec![0u8; (dw * dh * 4) as usize];
     for y in 0..dh {
         let sy = (y as u64 * sh as u64 / dh as u64) as u32;
         for x in 0..dw {
             let sx = (x as u64 * sw as u64 / dw as u64) as u32;
             let si = ((sy * sw + sx) * 3) as usize;
-            let di = ((y * dw + x) * 3) as usize;
-            dst[di..di + 3].copy_from_slice(&src[si..si + 3]);
+            let di = ((y * dw + x) * 4) as usize;
+            dst[di] = src[si];
+            dst[di + 1] = src[si + 1];
+            dst[di + 2] = src[si + 2];
+            dst[di + 3] = 255;
         }
     }
     dst

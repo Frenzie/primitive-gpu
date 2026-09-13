@@ -80,6 +80,10 @@ impl Engine {
             },
             None,
         ))?;
+        device.on_uncaptured_error(Box::new(|e| {
+            eprintln!("wgpu error: {e}");
+            std::process::exit(2);
+        }));
 
         let n_px = (w * h) as u64;
         let target_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -119,10 +123,13 @@ impl Engine {
         });
 
         let mk_mod = |src: &str, label: &'static str| {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            eprintln!("creating shader module {label}");
+            let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(src.to_string().into()),
-            })
+            });
+            eprintln!("created shader module {label}");
+            m
         };
         let optimize_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("optimize"),

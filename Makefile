@@ -29,7 +29,9 @@ $(LIB) $(SOLIB): src/lib.rs src/capi.rs src/engine.rs src/shapes.rs src/io.rs sr
 
 capi: $(LIB) $(SOLIB)
 
-cap  i-test: $(LIB)
+capi-test: capi
+	$(CC) -O2 -I c -o /tmp/test_capi c/test_capi.c $(LIB) -lpthread -ldl -lm
+	/tmp/test_capi
 
 # Native ffmpeg filter (requires libavfilter-dev, libavutil-dev)
 libfilter_primitive.so: $(LIB) c/vf_primitive.c

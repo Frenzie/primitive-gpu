@@ -1,0 +1,87 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Software Vulkan for GPU-less runners
+  WGPU_BACKEND: vulkan
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mesa-vulkan-drivers libvulkan1 vulkan-tools ffmpeg
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --verbose
+
+      - name: Validate WGSL shaders
+        run: cargo run --release --bin wgsl-check
+
+      - name: Build C ABI libraries
+        run: cargo build --release --features capi
+
+      - name: C ABI smoke test
+        run: |
+          cc -O2 -I c -o /tmp/test_capi c/test_capi.c \
+            target/release/libprimitive_gpu.a -lpthread -ldl -lm
+          /tmp/test_capi
+
+      - name: Image smoke test
+        run: |
+          ffmpeg -y -v error -f lavfi -i testsrc2=size=320x180:rate=10:duration=1 \
+            -frames:v 1 /tmp/source.png
+          ./target/release/primitive-gpu -i /tmp/source.png -o /tmp/out.png \
+            -n 20 --seed 7 -s 512 --ss 1
+          test -s /tmp/out.png && echo "image OK"
+
+      - name: Video pipe smoke test
+        run: |
+          ffmpeg -y -v error -f lavfi -i testsrc2=size=320x180:rate=10:duration=1 \
+            -pix_fmt rgb24 -f rawvideo - \
+            | ./target/release/primitive-gpu --video --vw 320 --vh 180 -n 5 \
+            | ffmpeg -y -v error -f rawvideo -pix_fmt rgb24 -s 320x180 -r 10 -i - \
+              -c:v libx264 -preset ultrafast -pix_fmt yuv420p /tmp/test_out.mp4
+          COUNT=$(ffprobe -v error -count_frames -select_streams v:0 \
+            -show_entries stream=nb_read_frames -of csv=p=0 /tmp/test_out.mp4)
+          echo "frames encoded: $COUNT"
+          test "$COUNT" = "10" && echo "video OK"
+
+      - name: Video reuse smoke test
+        run: |
+          ffmpeg -y -v error -f lavfi -i testsrc2=size=320x180:rate=10:duration=3 \
+            -pix_fmt rgb24 -f rawvideo - \
+          | ./target/release/primitive-gpu --video --vw 320 --vh 180 -n 10 \
+              --reuse --max-shapes 100 \
+          | ffmpeg -y -v error -f rawvideo -pix_fmt rgb24 -s 320x180 -r 10 -i - \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p /tmp/test_reuse.mp4
+          COUNT=$(ffprobe -v error -count_frames -select_streams v:0 \
+            -show_entries stream=nb_read_frames -of csv=p=0 /tmp/test_reuse.mp4)
+          echo "frames encoded: $COUNT"
+          test "$COUNT" = "30" && echo "video-reuse OK"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: primitive-gpu-linux-x64
+          path: |
+            target/release/primitive-gpu
+            target/release/libprimitive_gpu.a
+            target/release/libprimitive_gpu.so
+            c/primitive_gpu.h
+          if-no-files-found: error

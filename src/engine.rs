@@ -539,6 +539,135 @@ impl Engine {
         let bg_u = bg_packed(self.bg);
         let canvas = vec![bg_u; (self.w * self.h) as usize];
         self.queue.write_buffer(&self.canvas_buf, 0, bytemuck::cast_slice(&canvas));
+        self.score = initial_score(&target, self.w, self.h, self.bg);
+    }
+
+    /// Begin a new frame reusing the previous frame's shape list: reset the
+    /// canvas to bg, rescore every retained shape against the new target,
+    /// then re-commit those that still improve the score. Returns the number
+    /// of retained shapes.
+    pub fn begin_frame_reuse(&mut self, target: Vec<u8>) -> Result<u32> {
+        let n_prev = self.num_shapes;
+        self.num_shapes = 0;
+        self.queue.write_buffer(&self.target_buf, 0, &target);
+        let bg_u = bg_packed(self.bg);
+        let canvas = vec![bg_u; (self.w * self.h) as usize];
+        self.queue.write_buffer(&self.canvas_buf, 0, bytemuck::cast_slice(&canvas));
+        let score0 = initial_score(&target, self.w, self.h, self.bg);
+        self.score = score0;
+
+        if n_prev == 0 {
+            return Ok(0);
+        }
+
+        // copy the previous shape list into winners (rescored in place)
+        self.copy_prev_shapes_to_winners(n_prev)?;
+
+        // dispatch rescore: one thread per shape, in place on winners
+        let mut u = self.uniform();
+        u.num_shapes = n_prev;
+        u.cur_score = (score0 as f32).to_bits();
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&u));
+        let mut enc =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rescore") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rescore"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.rescore_pipeline);
+            pass.set_bind_group(0, &self.rescore_bg, &[]);
+            pass.dispatch_workgroups((n_prev + 63) / 64, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(
+            &self.winners_buf,
+            0,
+            &self.readback_buf,
+            0,
+            n_prev as u64 * ROW_BYTES as u64,
+        );
+        self.queue.submit(Some(enc.finish()));
+        let raw = crate::gpuio::read_bytes(&self.device, &self.readback_buf);
+        let rows: &[f32] = bytemuck::cast_slice(&raw);
+
+        // sort by score (CPU): improving rows (score < score0) first
+        let mut list: Vec<[f32; ROW]> = (0..n_prev as usize)
+            .filter(|i| {
+                let r = &rows[i * ROW..(i + 1) * ROW];
+                r[1] != 0.0 && r[0] < score0 as f32
+            })
+            .map(|i| {
+                let mut r = [0f32; ROW];
+                r.copy_from_slice(&rows[i * ROW..(i + 1) * ROW]);
+                r
+            })
+            .collect();
+        list.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+
+        if std::env::var("PG_TRACE_REUSE").is_ok() {
+            let mut scs: Vec<String> = list.iter().map(|r| format!("{:.4}", r[0])).collect();
+            scs.truncate(8);
+            eprintln!("  score0={score0:.4} best-rescored: {}", scs.join(" "));
+        }
+        // re-commit retained shapes in score order (greedy: keep if it
+        // still improves the running score)
+        let mut kept = 0u32;
+        for row in &list {
+            if row[0] >= score0 as f32 {
+                break;
+            }
+            self.queue.write_buffer(
+                &self.shapes_buf,
+                self.num_shapes as u64 * ROW_BYTES as u64,
+                bytemuck::bytes_of(row),
+            );
+            self.queue
+                .write_buffer(&self.winners_buf, 0, bytemuck::bytes_of(row));
+            let u2 = self.uniform();
+            self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&u2));
+            let mut enc =
+                self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("commit") });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("commit"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.commit_pipeline);
+                pass.set_bind_group(0, &self.commit_bg, &[]);
+                pass.dispatch_workgroups((self.w * self.h + 63) / 64, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            self.score = row[0] as f64;
+            self.num_shapes += 1;
+            kept += 1;
+        }
+        Ok(kept)
+    }
+
+    /// Keep only the first n shapes (lowest rescored scores come first
+    /// after begin_frame_reuse, so this drops the least useful ones).
+    pub fn trim_to(&mut self, n: u32) {
+        if self.num_shapes > n {
+            self.num_shapes = n;
+        }
+    }
+
+    fn copy_prev_shapes_to_winners(&self, n: u32) -> Result<()> {
+        let sz = n as u64 * ROW_BYTES as u64;
+        let rb = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prev-shapes"),
+            size: sz,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut e1 = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        e1.copy_buffer_to_buffer(&self.shapes_buf, 0, &rb, 0, sz);
+        self.queue.submit(Some(e1.finish()));
+        let data = crate::gpuio::read_bytes(&self.device, &rb);
+        self.queue.write_buffer(&self.winners_buf, 0, &data);
+        Ok(())
     }
 }
 

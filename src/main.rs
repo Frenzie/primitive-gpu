@@ -19,6 +19,8 @@ fn main() -> Result<()> {
     let mut ss = 2u32;
     let mut seed = 42u32;
     let mut video_mode = false;
+    let mut reuse = false;
+    let mut max_shapes = 300u32;
     let mut vw = 1920u32;
     let mut vh = 1080u32;
 
@@ -64,6 +66,13 @@ fn main() -> Result<()> {
             "--video" => {
                 video_mode = true;
             }
+            "--reuse" => {
+                reuse = true;
+            }
+            "--max-shapes" => {
+                i += 1;
+                max_shapes = args[i].parse()?;
+            }
             "--vw" => {
                 i += 1;
                 vw = args[i].parse()?;
@@ -78,7 +87,7 @@ fn main() -> Result<()> {
     }
 
     if video_mode {
-        run_video(vw, vh, num, mode, alpha, input_size, ss, seed)?;
+        run_video(vw, vh, num, mode, alpha, input_size, ss, seed, reuse, max_shapes)?;
         return Ok(());
     }
 
@@ -129,6 +138,8 @@ fn run_video(
     input_size: u32,
     ss: u32,
     seed: u32,
+    reuse: bool,
+    max_shapes: u32,
 ) -> Result<()> {
     use std::io::{Read, Write};
     let bpp = 3usize; // rgb24
@@ -150,14 +161,29 @@ fn run_video(
             eng = Some(Engine::new(target.clone(), iw, ih, vw, vh, ss, bg)?);
         }
         let e = eng.as_mut().unwrap();
-        e.reset_for_frame(target);
+        let kept = if reuse && frame_idx > 0 {
+            let k = e.begin_frame_reuse(target)?;
+            e.trim_to(max_shapes);
+            k
+        } else {
+            e.reset_for_frame(target);
+            0
+        };
+        eprintln!("frame {frame_idx}: {kept} reused");
         for s in 0..num {
             e.set_shape_type(mode);
             e.set_alpha(alpha);
             e.set_frame_seed(seed ^ (frame_idx << 8) ^ s);
             e.step(mode, alpha, seed ^ (frame_idx << 8) ^ s)?;
         }
-        let img = e.render()?;
+        let mut img = e.render();
+        for _ in 0..4 {
+            if img.is_ok() {
+                break;
+            }
+            img = e.render();
+        }
+        let img = img?;
         // RGBA -> RGB
         let mut rgb = vec![0u8; frame_bytes];
         for (o, chunk) in img.chunks_exact(4).enumerate() {

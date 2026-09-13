@@ -1,11 +1,8 @@
-mod engine;
-mod gpuio;
-mod io;
-mod shapes;
+// module wiring lives in lib.rs for the binary
 
 use anyhow::Result;
-use engine::Engine;
-use shapes::{MODE_TRIANGLE, ROW};
+use primitive_gpu::engine::Engine;
+use primitive_gpu::shapes::{MODE_TRIANGLE, ROW};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -95,8 +92,8 @@ fn main() -> Result<()> {
         anyhow::bail!("usage: primitive-gpu -i input -o output [-n count] [-m mode] [-a alpha] [-r size] [-s size] [--ss n] [--seed n] [--video --vw w --vh h]");
     }
 
-    let frame = io::load_target(&input, input_size)?;
-    let bg = io::average_color(&frame.target, frame.w, frame.h);
+    let frame = primitive_gpu::io::load_target(&input, input_size)?;
+    let bg = primitive_gpu::io::average_color(&frame.target, frame.w, frame.h);
     let out_w = if frame.w >= frame.h { output_size } else { output_size * frame.w / frame.h };
     let out_h = if frame.w >= frame.h { output_size * frame.h / frame.w } else { output_size };
 
@@ -124,7 +121,7 @@ fn main() -> Result<()> {
             break;
         }
     }
-    io::save_png(&output, out_w, out_h, &img)?;
+    primitive_gpu::io::save_png(&output, out_w, out_h, &img)?;
     eprintln!("wrote {} ({} shapes, score {:.4})", output, num, eng.score);
     Ok(())
 }
@@ -157,7 +154,7 @@ fn run_video(
         let (iw, ih) = if vw >= vh { (input_size, input_size * vh / vw) } else { (input_size * vw / vh, input_size) };
         let target = resize_rgb24(&buf, vw, vh, iw, ih);
         if eng.is_none() {
-            let bg = io::average_color(&target, iw, ih);
+            let bg = primitive_gpu::io::average_color(&target, iw, ih);
             eng = Some(Engine::new(target.clone(), iw, ih, vw, vh, ss, bg)?);
         }
         let e = eng.as_mut().unwrap();

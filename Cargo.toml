@@ -3,6 +3,13 @@ name = "primitive-gpu"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "primitive_gpu"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[features]
+capi = []
+
 [dependencies]
 naga = { version = "24", features = ["wgsl-in"] }
 wgpu = "24"

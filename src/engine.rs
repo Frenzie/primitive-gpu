@@ -32,6 +32,8 @@ pub struct Engine {
     alpha: i32,
     frame_seed: u32,
     age: u32,
+    max_shapes: u32,
+    steps_per_frame: u32,
 }
 
 #[repr(C)]
@@ -318,6 +320,8 @@ impl Engine {
             alpha: 128,
             frame_seed: 0,
             age: AGE,
+            max_shapes: 200,
+            steps_per_frame: 8,
         })
     }
 
@@ -531,6 +535,14 @@ impl Engine {
         self.age = a;
     }
 
+    pub fn set_shapes_per_frame(&mut self, _n: u32) {
+        // per-frame count is controlled by the caller's step loop
+    }
+
+    pub fn set_max_shapes(&mut self, n: u32) {
+        self.max_shapes = n;
+    }
+
     /// Start a fresh optimization for a new video frame.
     pub fn reset_for_frame(&mut self, target: Vec<u8>) {
         self.num_shapes = 0;
@@ -650,6 +662,30 @@ impl Engine {
         if self.num_shapes > n {
             self.num_shapes = n;
         }
+    }
+
+    pub fn shape_limit(&self) -> u32 {
+        self.max_shapes
+    }
+
+    pub fn steps_per_frame(&self) -> u32 {
+        self.steps_per_frame
+    }
+
+    pub fn set_steps_per_frame(&mut self, n: u32) {
+        self.steps_per_frame = n;
+    }
+
+    pub fn seed(&self) -> u32 {
+        self.frame_seed
+    }
+
+    pub fn shape_type(&self) -> i32 {
+        self.shape_type
+    }
+
+    pub fn alpha(&self) -> i32 {
+        self.alpha
     }
 
     fn copy_prev_shapes_to_winners(&self, n: u32) -> Result<()> {

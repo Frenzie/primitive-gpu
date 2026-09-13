@@ -4,6 +4,14 @@ A GPU (Vulkan compute shader via [wgpu](https://wgpu.rs)) port of
 [fogleman/primitive](https://github.com/fogleman/primitive), designed to also
 work as an **optional effect for ffmpeg**.
 
+ffmpeg does not support runtime-loaded third-party filters, so the tool is
+written as a standalone executable rather than a plugin: it reads rawvideo on
+stdin, writes rawvideo on stdout, and slots between two ffmpeg processes.
+This is why image data flows through pipes instead of file arguments, why the
+engine is created once and reused across frames, and why everything is plain
+rgb24 in and out — the design choices all follow from making the ffmpeg
+pipeline the primary interface (see [Video pipe mode](#video-pipe-mode-ffmpeg)).
+
 Reproduces images with geometric primitives: starting from a solid background,
 the optimizer repeatedly finds the single shape that most reduces the RMSE
 against the target image, and commits it to the canvas. ~50–200 shapes produce

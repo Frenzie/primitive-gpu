@@ -15,6 +15,8 @@ pub struct Engine {
     optimize_pipeline: wgpu::ComputePipeline,
     commit_pipeline: wgpu::ComputePipeline,
     render_pipeline: wgpu::ComputePipeline,
+    render_out_buf: wgpu::Buffer,
+    render_bg: wgpu::BindGroup,
     readback_buf: wgpu::Buffer,
     pub w: u32,
     pub h: u32,
@@ -45,14 +47,78 @@ struct Uniform {
     out_w: u32,
     out_h: u32,
     ss: u32,
-    pad0: u32,
+    cur_score: u32,
     pad1: u32,
     pad2: u32,
 }
 
-const WG_COUNT: u32 = 64; // hill-climb chains per step
+const WG_COUNT: u32 = 64; // workgroups per optimize dispatch
+const WG_SIZE: u32 = 64; // threads per workgroup
+const WG_THREADS: u32 = WG_COUNT * WG_SIZE; // total hill-climb chains
 const ROUNDS: u32 = 24; // mutations per chain
 const N_RANDOM: u32 = 16; // random candidates per chain start
+
+fn pick_adapter(instance: &wgpu::Instance) -> Result<(wgpu::Device, wgpu::Queue)> {
+    // Some drivers (Intel gen9 ANV on Mesa) lose the device compiling large
+    // shaders; probe each adapter against the real optimize shader and use
+    // the first healthy one.
+    for adapter in instance.enumerate_adapters(wgpu::Backends::all()) {
+        let info = adapter.get_info();
+        let res: Option<(wgpu::Device, wgpu::Queue)> = pollster::block_on(async {
+            let dev = adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("primitive-gpu"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: wgpu::Limits::default(),
+                        memory_hints: wgpu::MemoryHints::Performance,
+                    },
+                    None,
+                )
+                .await;
+            let (d, q) = match dev {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            let errored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = errored.clone();
+            d.on_uncaptured_error(Box::new(move |_| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+            let m = d.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("probe"),
+                source: wgpu::ShaderSource::Wgsl(OPTIMIZE_WGSL.to_string().into()),
+            });
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("probe"),
+                    layout: None,
+                    module: &m,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+            }))
+            .is_err();
+            let _ = d.poll(wgpu::Maintain::Wait);
+            let ok = !panicked && !errored.load(std::sync::atomic::Ordering::SeqCst);
+            drop(m);
+            if ok { Some((d, q)) } else { None }
+        });
+        match res {
+            Some((d, q)) => {
+                eprintln!("using adapter: {} ({:?})", info.name, info.device_type);
+                d.on_uncaptured_error(Box::new(|e| {
+                    eprintln!("fatal wgpu error: {e}");
+                    std::process::exit(2);
+                }));
+                return Ok((d, q));
+            }
+            None => eprintln!("skipping adapter: {} (shader compile failed)", info.name),
+        }
+    }
+    Err(anyhow!("no working Vulkan adapter"))
+}
 
 impl Engine {
     pub fn new(
@@ -65,42 +131,24 @@ impl Engine {
         bg: [u8; 3],
     ) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .ok_or_else(|| anyhow!("no Vulkan-capable adapter found"))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("primitive-gpu"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))?;
-        device.on_uncaptured_error(Box::new(|e| {
-            eprintln!("wgpu error: {e}");
-            std::process::exit(2);
-        }));
+        let (device, queue) = pick_adapter(&instance)?;
 
         let n_px = (w * h) as u64;
         let target_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("target"),
             contents: &target,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let canvas_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("canvas"),
             size: n_px * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let winners_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("winners"),
-            size: WG_COUNT as u64 * ROW_BYTES as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            size: WG_THREADS as u64 * ROW_BYTES as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let shapes_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -117,61 +165,118 @@ impl Engine {
         });
         let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
-            size: WG_COUNT as u64 * ROW_BYTES as u64,
+            size: WG_THREADS as u64 * ROW_BYTES as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
-        let mk_mod = |src: &str, label: &'static str| {
-            eprintln!("creating shader module {label}");
-            let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        // Explicit layouts: naga prunes unused bindings from auto layouts,
+        // which made binding counts vary per kernel. Declare them exactly.
+        let uni = || wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let stor = |binding: u32, ro: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: ro },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let optimize_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("optimize-bgl"),
+            entries: &[uni(), stor(1, true), stor(2, true), stor(3, false)],
+        });
+        let commit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("commit-bgl"),
+            entries: &[uni(), stor(1, true), stor(2, false), stor(3, false)],
+        });
+        let render_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("render-bgl"),
+            entries: &[
+                uni(),
+                stor(1, true),
+                stor(2, true),
+                stor(3, true),
+                stor(4, true),
+                stor(5, false),
+            ],
+        });
+
+        let mk = |label: &'static str, src: &str, bgl: &wgpu::BindGroupLayout| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(src.to_string().into()),
             });
-            eprintln!("created shader module {label}");
-            m
-        };
-        let optimize_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("optimize"),
-            layout: None,
-            module: &mk_mod(OPTIMIZE_WGSL, "optimize"),
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let commit_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("commit"),
-            layout: None,
-            module: &mk_mod(COMMIT_WGSL, "commit"),
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let render_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("render"),
-            layout: None,
-            module: &mk_mod(RENDER_WGSL, "render"),
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let bind = |pipeline: &wgpu::ComputePipeline| {
-            let layout = pipeline.get_bind_group_layout(0);
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: target_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: canvas_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: winners_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: shapes_buf.as_entire_binding() },
-                ],
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[bgl],
+                push_constant_ranges: &[],
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
             })
         };
-        let optimize_bg = bind(&optimize_pipeline);
-        let commit_bg = bind(&commit_pipeline);
+        let optimize_pipeline = mk("optimize", OPTIMIZE_WGSL, &optimize_bgl);
+        let commit_pipeline = mk("commit", COMMIT_WGSL, &commit_bgl);
+        let render_pipeline = mk("render", RENDER_WGSL, &render_bgl);
+
+        let pb = params_buf.as_entire_binding();
+        let tb = target_buf.as_entire_binding();
+        let cb = canvas_buf.as_entire_binding();
+        let wb = winners_buf.as_entire_binding();
+        let sb = shapes_buf.as_entire_binding();
+        let mk_bg = |bgl: &wgpu::BindGroupLayout, extra: Option<wgpu::BindGroupEntry>| {
+            let mut entries = vec![
+                wgpu::BindGroupEntry { binding: 0, resource: pb.clone() },
+                wgpu::BindGroupEntry { binding: 1, resource: tb.clone() },
+                wgpu::BindGroupEntry { binding: 2, resource: cb.clone() },
+                wgpu::BindGroupEntry { binding: 3, resource: wb.clone() },
+            ];
+            if let Some(e) = extra {
+                entries.push(e);
+            }
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: bgl,
+                entries: &entries,
+            })
+        };
+        let optimize_bg = mk_bg(&optimize_bgl, None);
+        let commit_bg = mk_bg(&commit_bgl, None);
+        // render needs bindings 4 (shapes) and 5 (output): a persistent buffer.
+        let render_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render-out"),
+            size: (out_w as u64) * (out_h as u64) * (ss as u64) * (ss as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let render_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &render_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pb.clone() },
+                wgpu::BindGroupEntry { binding: 1, resource: tb.clone() },
+                wgpu::BindGroupEntry { binding: 2, resource: cb.clone() },
+                wgpu::BindGroupEntry { binding: 3, resource: wb.clone() },
+                wgpu::BindGroupEntry { binding: 4, resource: sb.clone() },
+                wgpu::BindGroupEntry { binding: 5, resource: render_out_buf.as_entire_binding() },
+            ],
+        });
 
         // seed canvas with bg color
         let bg_u = bg_packed(bg);
@@ -191,6 +296,8 @@ impl Engine {
             optimize_pipeline,
             commit_pipeline,
             render_pipeline,
+            render_out_buf,
+            render_bg,
             readback_buf,
             w,
             h,
@@ -221,7 +328,7 @@ impl Engine {
             out_w: self.out_w,
             out_h: self.out_h,
             ss: self.ss,
-            pad0: 0,
+            cur_score: (self.score as f32).to_bits(),
             pad1: 0,
             pad2: 0,
         }
@@ -248,7 +355,7 @@ impl Engine {
             0,
             &self.readback_buf,
             0,
-            WG_COUNT as u64 * ROW_BYTES as u64,
+            WG_THREADS as u64 * ROW_BYTES as u64,
         );
         self.queue.submit(Some(enc.finish()));
 
@@ -256,7 +363,7 @@ impl Engine {
         let rows: &[f32] = bytemuck::cast_slice(&raw);
         let mut best = [0f32; ROW];
         best[0] = f32::INFINITY;
-        for wg in 0..WG_COUNT as usize {
+        for wg in 0..WG_THREADS as usize {
             let r = &rows[wg * ROW..(wg + 1) * ROW];
             if r[0] < best[0] {
                 best.copy_from_slice(r);
@@ -272,6 +379,8 @@ impl Engine {
             bytemuck::bytes_of(&best),
         );
         self.num_shapes += 1;
+        self.queue
+            .write_buffer(&self.winners_buf, 0, bytemuck::bytes_of(&best));
 
         let u2 = self.uniform();
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&u2));
@@ -296,29 +405,11 @@ impl Engine {
         let w = self.out_w * self.ss;
         let h = self.out_h * self.ss;
         let n_px = (w * h) as u64;
-        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("render-out"),
-            size: n_px * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
         let rb_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("render-read"),
             size: n_px * 4,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
-        });
-        let render_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.render_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.target_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.canvas_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.winners_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.shapes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
-            ],
         });
         let u = self.uniform();
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&u));
@@ -330,10 +421,11 @@ impl Engine {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.render_pipeline);
-            pass.set_bind_group(0, &render_bg, &[]);
-            pass.dispatch_workgroups(((n_px + 63) / 64) as u32, 1, 1);
+            pass.set_bind_group(0, &self.render_bg, &[]);
+            pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
-        enc.copy_buffer_to_buffer(&out_buf, 0, &rb_buf, 0, n_px * 4);
+        // copy from the persistent render-out buffer (binding 5)
+        enc.copy_buffer_to_buffer(&self.render_out_buf, 0, &rb_buf, 0, n_px * 4);
         self.queue.submit(Some(enc.finish()));
         let data = crate::gpuio::read_bytes(&self.device, &rb_buf);
 
@@ -359,6 +451,21 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// Debug helper: read back the canvas buffer.
+    pub fn read_canvas_probe(&self) -> Vec<u8> {
+        let size = (self.w * self.h * 4) as u64;
+        let rb = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("canvas-probe"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(&self.canvas_buf, 0, &rb, 0, size);
+        self.queue.submit(Some(enc.finish()));
+        crate::gpuio::read_bytes(&self.device, &rb)
     }
 
     pub fn set_shape_type(&mut self, t: i32) {

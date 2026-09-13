@@ -15,7 +15,7 @@ struct Params {
     out_w: u32,
     out_h: u32,
     ss: u32,
-    pad0: u32,
+    cur_score: u32,
     pad1: u32,
     pad2: u32,
 };
@@ -27,16 +27,16 @@ struct Params {
 @group(0) @binding(4) var<storage, read> shapes: array<f32>;
 @group(0) @binding(5) var<storage, read_write> shapes_out_alias: array<u32>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
     let w = params.out_w * params.ss;
     let h = params.out_h * params.ss;
-    if (idx >= w * h) {
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= w || py >= h) {
         return;
     }
-    let px = idx % w;
-    let py = idx / w;
+    let idx = py * w + px;
 
     // map output sample to internal optimization space
     let fx = (f32(px) + 0.5) * f32(params.width) / f32(w);

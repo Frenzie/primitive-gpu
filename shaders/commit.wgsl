@@ -15,7 +15,7 @@ struct Params {
     out_w: u32,
     out_h: u32,
     ss: u32,
-    pad0: u32,
+    cur_score: u32,
     pad1: u32,
     pad2: u32,
 };
@@ -40,16 +40,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let alpha = u32(max(winners[2], 1.0));
     var p: array<f32, 8>;
     for (var i = 0u; i < 8u; i = i + 1u) {
-        p[i] = winners[3 + i];
+        p[i] = winners[6 + i];
     }
     if (!inside_of(id, p, x, y)) {
         return;
     }
-    // optimal color was stored in winners[4..7] (r,g,b) by the optimizer via
-    // the argmin kernel; blend source-over with NRGBA semantics.
-    let sr = winners[4];
-    let sg = winners[5];
-    let sb = winners[6];
+    // optimal color stored in winners[3..6] by the optimizer
+    let sr = winners[3];
+    let sg = winners[4];
+    let sb = winners[5];
     let sa = f32(alpha) / 255.0;
     let cpx = cur[idx];
     let dr = f32(cpx & 0xffu);

@@ -18,7 +18,7 @@ struct Params {
     out_w: u32,
     out_h: u32,
     ss: u32,
-    pad0: u32,
+    cur_score: u32,
     pad1: u32,
     pad2: u32,
 };
@@ -159,7 +159,7 @@ fn random_shape(c: ptr<function, array<f32, 14>>) {
         }
     }
     for (var i = 0u; i < 8u; i = i + 1u) {
-        (*c)[3 + i] = p[i];
+        (*c)[6 + i] = p[i];
     }
 }
 
@@ -203,7 +203,7 @@ fn mutate_row(c: ptr<function, array<f32, 14>>) {
     let t = u32((*c)[1]);
     var p: array<f32, 8>;
     for (var i = 0u; i < 8u; i = i + 1u) {
-        p[i] = (*c)[3 + i];
+        p[i] = (*c)[6 + i];
     }
     let w = f32(params.width);
     let h = f32(params.height);
@@ -281,7 +281,7 @@ fn mutate_row(c: ptr<function, array<f32, 14>>) {
         }
     }
     for (var i = 0u; i < 8u; i = i + 1u) {
-        (*c)[3 + i] = p[i];
+        (*c)[6 + i] = p[i];
     }
     if (params.alpha == 0) {
         (*c)[2] = f32(clamp(i32((*c)[2]) + i32(ru() % 21u) - i32(10u), 1, 255));
@@ -297,14 +297,14 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
     let id = u32((*c)[1]);
     var p: array<f32, 8>;
     for (var i = 0u; i < 8u; i = i + 1u) {
-        p[i] = (*c)[3 + i];
+        p[i] = (*c)[6 + i];
     }
     let bb = bbox_of(id, p);
     let x0 = max(i32(bb.x), 0);
     let x1 = min(i32(bb.z), i32(w) - 1);
     let y0 = max(i32(bb.y), 0);
     let y1 = min(i32(bb.w), i32(h) - 1);
-    let a = f32(max((*c)[2], 1.0)) / 255.0;
+    let a = 255.0 / f32(max((*c)[2], 1.0));
 
     var sr = 0.0;
     var sg = 0.0;
@@ -328,9 +328,6 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
             x = x + 1;
         }
         y = y + 1;
-    }
-    if (area < 1.0) {
-        return 1e30;
     }
     // optimal alpha-blended color over the region (matches computeColor)
     let cr0 = 0.0; // placeholder replaced below by canvas avg trick:
@@ -356,9 +353,12 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
         }
         y = y + 1;
     }
-    let colr = clamp((sr * a + csr) / area, 0.0, 255.0);
-    let colg = clamp((sg * a + csg) / area, 0.0, 255.0);
-    let colb = clamp((sb * a + csb) / area, 0.0, 255.0);
+    let colr = clamp((sr * a + csr) / max(area, 1.0), 0.0, 255.0);
+    let colg = clamp((sg * a + csg) / max(area, 1.0), 0.0, 255.0);
+    let colb = clamp((sb * a + csb) / max(area, 1.0), 0.0, 255.0);
+    (*c)[3] = colr;
+    (*c)[4] = colg;
+    (*c)[5] = colb;
 
     var err2 = 0.0;
     y = y0;
@@ -389,10 +389,7 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
         }
         y = y + 1;
     }
-    let cur = (*c)[0];
-    if (cur >= 1e29) {
-        return 1e30;
-    }
+    let cur = bitcast<f32>(params.cur_score);
     let sse = (cur * 255.0) * (cur * 255.0) * n * 3.0 + err2;
     let rmse = sqrt(max(sse, 0.0) / (n * 3.0)) / 255.0;
     return rmse;

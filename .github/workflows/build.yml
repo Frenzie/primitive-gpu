@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -75,7 +76,23 @@ jobs:
           echo "frames encoded: $COUNT"
           test "$COUNT" = "30" && echo "video-reuse OK"
 
-      - name: Upload artifacts
+      - name: Package release archives
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          mkdir -p dist/primitive-gpu-${VERSION}-linux-x64/bin
+          cp target/release/primitive-gpu dist/primitive-gpu-${VERSION}-linux-x64/bin/
+          cp README.md dist/primitive-gpu-${VERSION}-linux-x64/
+          mkdir -p dist/primitive-gpu-capi-${VERSION}-linux-x64/lib
+          cp target/release/libprimitive_gpu.a \
+             target/release/libprimitive_gpu.so \
+             dist/primitive-gpu-capi-${VERSION}-linux-x64/lib/
+          cp c/primitive_gpu.h README.md dist/primitive-gpu-capi-${VERSION}-linux-x64/
+          cd dist
+          zip -r primitive-gpu-${VERSION}-linux-x64.zip primitive-gpu-${VERSION}-linux-x64
+          zip -r primitive-gpu-capi-${VERSION}-linux-x64.zip primitive-gpu-capi-${VERSION}-linux-x64
+
+      - name: Upload build artifacts (every run)
         uses: actions/upload-artifact@v4
         with:
           name: primitive-gpu-linux-x64
@@ -85,3 +102,11 @@ jobs:
             target/release/libprimitive_gpu.so
             c/primitive_gpu.h
           if-no-files-found: error
+
+      - name: Attach archives to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/primitive-gpu-*-linux-x64.zip
+            dist/primitive-gpu-capi-*-linux-x64.zip

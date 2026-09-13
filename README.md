@@ -147,3 +147,10 @@ problem — the batched kernel should be fine on healthier hardware.
 - PNG output only; the shape list stays on the GPU.
 - Temporal reuse for video (new).
 - `make go` initializes the Go repo (it predates Go modules) for A/B runs.
+
+## Roadmap
+
+- Workgroup-batched hill-climb kernel behind a flag (design is sound; blocked
+  on gen9 Mesa instability)
+- Compile-test the native filter against libavfilter-dev
+- CLI flags for per-chain tuning (rounds, candidates, age)

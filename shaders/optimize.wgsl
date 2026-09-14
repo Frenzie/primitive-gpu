@@ -322,68 +322,16 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
     let y1 = min(i32(bb.w), i32(h) - 1);
     let a = 255.0 / f32(max((*c)[2], 1.0));
 
-    var sr = 0.0;
-    var sg = 0.0;
-    var sb = 0.0;
-    var area = 0.0;
+    // One pass, exact per-channel integer sums.
+    var dr = 0i; var dg = 0i; var db = 0i;
+    var csr = 0i; var csg = 0i; var csb = 0i;
+    var area = 0i;
+    var t2r = 0i; var t2g = 0i; var t2b = 0i;
+    var c2r = 0i; var c2g = 0i; var c2b = 0i;
+    var tcr = 0i; var tcg = 0i; var tcb = 0i;
     var y = y0;
     loop {
         if (y > y1) { break; }
-        var x = x0;
-        loop {
-            if (x > x1) { break; }
-            if (inside_of(id, p, f32(x), f32(y))) {
-                let idx = u32(y) * w + u32(x);
-                let tpx = tgt[idx];
-                let cpx = cur[idx];
-                sr = sr + (f32(tpx & 0xffu) - f32(cpx & 0xffu));
-                sg = sg + (f32((tpx >> 8u) & 0xffu) - f32((cpx >> 8u) & 0xffu));
-                sb = sb + (f32((tpx >> 16u) & 0xffu) - f32((cpx >> 16u) & 0xffu));
-                area = area + 1.0;
-            }
-            x = x + 1;
-        }
-        y = y + 1;
-    }
-    // optimal alpha-blended color over the region (matches computeColor)
-    let cr0 = 0.0; // placeholder replaced below by canvas avg trick:
-    // NOTE: exact color formula needs canvas color sums too, so do a second
-    // accumulation for canvas sums on the region:
-    var csr = 0.0;
-    var csg = 0.0;
-    var csb = 0.0;
-    y = y0;
-    loop {
-        if (y > y1) { break; }
-        var x = x0;
-        loop {
-            if (x > x1) { break; }
-            if (inside_of(id, p, f32(x), f32(y))) {
-                let idx = u32(y) * w + u32(x);
-                let cpx = cur[idx];
-                csr = csr + f32(cpx & 0xffu);
-                csg = csg + f32((cpx >> 8u) & 0xffu);
-                csb = csb + f32((cpx >> 16u) & 0xffu);
-            }
-            x = x + 1;
-        }
-        y = y + 1;
-    }
-    let colr = clamp((sr * a + csr) / max(area, 1.0), 0.0, 255.0);
-    let colg = clamp((sg * a + csg) / max(area, 1.0), 0.0, 255.0);
-    let colb = clamp((sb * a + csb) / max(area, 1.0), 0.0, 255.0);
-    (*c)[3] = colr;
-    (*c)[4] = colg;
-    (*c)[5] = colb;
-
-    // err2 accumulated exactly per row (i32), rows summed in f32.
-    // Row magnitude <= 3*256*255^2 ~ 5e7; f32 sums of 256 exact rows keep
-    // error ~1e3, which is negligible vs the signal.
-    var err2 = 0.0;
-    y = y0;
-    loop {
-        if (y > y1) { break; }
-        var row_err = 0;
         var x = x0;
         loop {
             if (x > x1) { break; }
@@ -397,19 +345,42 @@ fn score_serial(c: ptr<function, array<f32, 14>>) -> f32 {
                 let cr = i32(cpx & 0xffu);
                 let cg = i32((cpx >> 8u) & 0xffu);
                 let cb = i32((cpx >> 16u) & 0xffu);
-                let nr = tr - i32(colr);
-                let ng = tg - i32(colg);
-                let nb = tb - i32(colb);
-                row_err = row_err + (nr*nr + ng*ng + nb*nb - (tr-cr)*(tr-cr) - (tg-cg)*(tg-cg) - (tb-cb)*(tb-cb));
+                dr = dr + (tr - cr);
+                dg = dg + (tg - cg);
+                db = db + (tb - cb);
+                csr = csr + cr;
+                csg = csg + cg;
+                csb = csb + cb;
+                t2r = t2r + tr*tr; t2g = t2g + tg*tg; t2b = t2b + tb*tb;
+                c2r = c2r + cr*cr; c2g = c2g + cg*cg; c2b = c2b + cb*cb;
+                tcr = tcr + tr*cr; tcg = tcg + tg*cg; tcb = tcb + tb*cb;
+                area = area + 1;
             }
             x = x + 1;
         }
-        err2 = err2 + f32(row_err);
         y = y + 1;
     }
+    if (area < 1) {
+        return 1e30;
+    }
+    let fa = f32(area);
+    let colr = clamp((f32(dr) * a + f32(csr)) / fa, 0.0, 255.0);
+    let colg = clamp((f32(dg) * a + f32(csg)) / fa, 0.0, 255.0);
+    let colb = clamp((f32(db) * a + f32(csb)) / fa, 0.0, 255.0);
+    (*c)[3] = colr;
+    (*c)[4] = colg;
+    (*c)[5] = colb;
+
+    let sse_old = (f32(t2r) + f32(c2r) - 2.0 * f32(tcr))
+                + (f32(t2g) + f32(c2g) - 2.0 * f32(tcg))
+                + (f32(t2b) + f32(c2b) - 2.0 * f32(tcb));
+    let sse_new = (f32(t2r) - 2.0 * colr * (f32(dr) + f32(csr)) + fa * colr * colr)
+                + (f32(t2g) - 2.0 * colg * (f32(dg) + f32(csg)) + fa * colg * colg)
+                + (f32(t2b) - 2.0 * colb * (f32(db) + f32(csb)) + fa * colb * colb);
+    let d_sse = sse_new - sse_old;
+
     let cur = bitcast<f32>(params.cur_score);
-    // rmse_new^2 = rmse_old^2 + err2/(n*3), all in 0..255 channel units.
-    let mean = (cur * 255.0) * (cur * 255.0) + err2 / (n * 3.0);
-    let rmse = sqrt(max(mean, 0.0)) / 255.0;
-    return rmse;
+    let cur_sse = (cur * 255.0) * (cur * 255.0) * n * 3.0;
+    let new_sse = max(cur_sse + d_sse, 0.0);
+    return sqrt(new_sse / (n * 3.0)) / 255.0;
 }

@@ -12,11 +12,14 @@ env:
   # Software Vulkan for GPU-less runners
   WGPU_BACKEND: vulkan
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install test dependencies
         run: |
@@ -26,7 +29,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2  # v2.9.x is node24
 
       - name: Build
         run: cargo build --release --verbose
@@ -109,7 +112,7 @@ jobs:
           zip -r primitive-gpu-capi-${VERSION}-linux-x64.zip primitive-gpu-capi-${VERSION}-linux-x64
 
       - name: Upload build artifacts (every run)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: primitive-gpu-linux-x64
           path: |
@@ -121,7 +124,7 @@ jobs:
 
       - name: Attach archives to release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/primitive-gpu-*-linux-x64.zip
